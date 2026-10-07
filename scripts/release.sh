@@ -2,7 +2,7 @@
 #
 # Build and publish a MikiSSh release.
 #
-#   GH_TOKEN=github_pat_... ./scripts/release.sh v0.1.0
+#   GH_TOKEN=<fine-grained PAT with contents:write> ./scripts/release.sh v0.1.0
 #
 # Produces dist/, containing one tarball per platform plus SHA256SUMS and a
 # copy of install.sh, then attaches them all to a GitHub release. The tag is
