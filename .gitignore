@@ -1,0 +1,11 @@
+node_modules/
+certs/
+.ssh/
+id_ed25519
+*.key
+*.pub
+mikissh.config.json
+.cf-tunnel-token
+.env
+logs/
+.pm2/

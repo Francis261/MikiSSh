@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>MikiSSh</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: #0b0e14; color: #c8ccd4;
+    font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #bar { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: #11151f; border-bottom: 1px solid #1e2430; }
+  #bar b { color: #7ee787; letter-spacing: .5px; }
+  #status { font-size: 12px; color: #8b949e; margin-left: auto; }
+  #status.ok { color: #7ee787; }
+  #status.err { color: #ff7b72; }
+  #term { height: calc(100% - 39px); padding: 6px; }
+  #overlay { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: rgba(11,14,20,.94); z-index: 10; }
+  .card { width: min(360px, 92vw); background: #11151f; border: 1px solid #1e2430;
+    border-radius: 10px; padding: 20px; }
+  .card h1 { font-size: 15px; margin: 0 0 14px; }
+  .card label { display:block; font-size: 12px; color:#8b949e; margin: 10px 0 4px; }
+  .card input { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #2d333b;
+    background: #0b0e14; color: #c8ccd4; font: inherit; }
+  .card input:focus { outline: none; border-color: #7ee787; }
+  .card button { margin-top: 16px; width: 100%; padding: 9px; border: 0; border-radius: 6px;
+    background: #238636; color: #fff; font: inherit; cursor: pointer; }
+  .card button:hover { background: #2ea043; }
+  .card button:disabled { background: #21262d; color:#8b949e; cursor: not-allowed; }
+  .hint { font-size: 11px; color: #6e7681; margin-top: 12px; }
+  #err { color: #ff7b72; font-size: 12px; min-height: 16px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>MIKISSH</b>
+  <span style="font-size:12px;color:#8b949e" id="target"></span>
+  <span id="status">disconnected</span>
+</div>
+<div id="term"></div>
+
+<div id="overlay">
+  <form class="card" id="login">
+    <h1>Secure shell over WebSocket</h1>
+    <label for="url">Gateway</label>
+    <input id="url" name="url" autocomplete="off" spellcheck="false" required>
+    <label for="token">Access token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" required>
+    <div id="err"></div>
+    <button type="submit" id="go">Connect</button>
+    <div class="hint">Credentials are presented to the gateway only. The SSH
+      login happens server-side; nothing is stored in this browser.</div>
+  </form>
+</div>
+
+<script type="module">
+import { Terminal } from '/vendor/xterm.js';
+import { FitAddon } from '/vendor/fit.js';
+
+const T = { AUTH_REQUEST:0x01, AUTH_OK:0x02, AUTH_FAIL:0x03,
+  STDIN:0x10, STDOUT:0x11, STDERR:0x12, RESIZE:0x20, PING:0x21,
+  PONG:0x22, KEX:0x23, EXIT:0x30, ERROR:0x3f };
+
+const $ = (id) => document.getElementById(id);
+const status = (t, cls='') => { const e=$('status'); e.textContent=t; e.className=cls; };
+
+const term = new Terminal({
+  cursorBlink: true, fontSize: 13, fontFamily: 'ui-monospace, Menlo, monospace',
+  theme: { background:'#0b0e14', foreground:'#c8ccd4', cursor:'#7ee787',
+    selectionBackground:'#264f78' }, allowProposedApi: true,
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open($('term'));
+fit.fit();
+window.addEventListener('resize', () => { fit.fit(); sendResize(); });
+
+// Never let the browser consume keys we need (Ctrl/Cmd-C copy is fine).
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && ['c','v','x'].includes(e.key.toLowerCase())) return;
+  if ($('overlay').style.display !== 'none' && e.target.tagName === 'INPUT') return;
+});
+
+let ws = null, authed = false, exited = false;
+
+const enc = (t, p = new Uint8Array()) => {
+  const b = new Uint8Array(1 + p.length);
+  b[0] = t; b.set(p, 1); return b;
+};
+const send = (buf) => { if (ws?.readyState === WebSocket.OPEN) ws.send(buf); };
+
+function sendResize() {
+  if (!authed) return;
+  const buf = new Uint8Array(4);
+  new DataView(buf.buffer).setUint16(0, term.cols);
+  new DataView(buf.buffer).setUint16(2, term.rows);
+  send(enc(T.RESIZE, buf));
+}
+
+function connect(url, token) {
+  const u = new URL(url);
+  u.protocol = u.protocol === 'http:' ? 'ws:' : 'wss:';
+  // Pass the token as a subprotocol so it never lands in a query string.
+  const proto = ['mikissh', 't.' + token];
+  status('connecting…');
+  ws = new WebSocket(u.toString(), proto);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => status('handshaking…');
+
+  ws.onmessage = (ev) => {
+    const data = new Uint8Array(ev.data);
+    const type = data[0];
+    const payload = data.slice(1);
+    const text = () => new TextDecoder().decode(payload);
+
+    switch (type) {
+      case T.KEX:
+        send(enc(T.AUTH_REQUEST,
+          new TextEncoder().encode(JSON.stringify({
+            term: term.term, cols: term.cols, rows: term.rows }))));
+        break;
+      case T.AUTH_OK:
+        authed = true; exited = false;
+        $('overlay').style.display = 'none';
+        status('connected', 'ok');
+        $('target').textContent = u.host + u.pathname;
+        term.focus(); sendResize();
+        break;
+      case T.AUTH_FAIL:
+        status('auth failed', 'err');
+        failLogin(JSON.parse(text()).reason || 'unauthorized');
+        break;
+      case T.STDOUT:
+      case T.STDERR:
+        term.write(payload);
+        break;
+      case T.EXIT: {
+        const { code, signal } = JSON.parse(text());
+        term.write(`\r\n\x1b[33m[session ended: code ${code}${signal?` signal ${signal}`:''}]\x1b[0m\r\n`);
+        status('exited', 'err'); exited = true;
+        break;
+      }
+      case T.ERROR:
+        term.write(`\r\n\x1b[31m[${JSON.parse(text()).message}]\x1b[0m\r\n`);
+        break;
+      case T.PONG: break;
+      default: break;
+    }
+  };
+
+  ws.onerror = () => status('connection error', 'err');
+  ws.onclose = (ev) => {
+    authed = false;
+    if (!exited) {
+      status('disconnected' + (ev.code ? ` (${ev.code})` : ''), 'err');
+      if (ev.code === 1008) failLogin('unauthorized');
+      if ($('overlay').style.display === 'none') {
+        $('overlay').style.display = 'flex';
+      }
+    }
+  };
+}
+
+function failLogin(reason) {
+  const b = $('login');
+  if (b.style.display === 'none') return;
+  $('err').textContent = reason;
+  $('go').disabled = false;
+}
+
+term.onData((d) => { if (authed) send(enc(T.STDIN, new TextEncoder().encode(d))); });
+term.onBinary((d) => { if (authed) {
+  const p = new Uint8Array(d.length);
+  for (let i=0;i<d.length;i++) p[i]=d.charCodeAt(i)&0xff;
+  send(enc(T.STDIN, p));
+}});
+term.onResize(() => sendResize());
+
+// Keepalive.
+setInterval(() => { if (authed) send(enc(T.PING)); }, 25000);
+
+$('login').addEventListener('submit', (e) => {
+  e.preventDefault();
+  $('err').textContent = '';
+  $('go').disabled = true;
+  try { connect($('url').value.trim(), $('token').value.trim()); }
+  catch (err) { failLogin('invalid gateway URL'); $('go').disabled = false; }
+});
+
+// Prefill sensible defaults.
+const loc = location;
+$('url').value = (loc.protocol === 'https:' ? 'https://' : 'http://')
+  + loc.host + '/ssh';
+</script>
+</body>
+</html>

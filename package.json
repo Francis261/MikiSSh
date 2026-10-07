@@ -1,0 +1,26 @@
+{
+  "name": "mikissh",
+  "version": "0.1.0",
+  "description": "Secure SSH gateway over WebSocket",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "mikissh": "./bin/mikissh.js"
+  },
+  "scripts": {
+    "start": "node bin/mikissh.js server",
+    "client": "node bin/mikissh.js client",
+    "gen:cert": "node bin/mikissh.js gen-cert",
+    "gen:token": "node bin/mikissh.js gen-token",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "ssh2": "^1.17.0",
+    "ws": "^8.18.0"
+  }
+}
