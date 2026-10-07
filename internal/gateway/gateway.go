@@ -25,11 +25,13 @@ import (
 	"github.com/Francis261/MikiSSh/internal/protocol"
 	"github.com/Francis261/MikiSSh/internal/static"
 	"github.com/Francis261/MikiSSh/internal/tlsutil"
+	"github.com/Francis261/MikiSSh/public"
 	"github.com/coder/websocket"
 )
 
-// Version is reported in the KEX greeting.
-const Version = "0.1.0"
+// Version is reported in the KEX greeting. It is a var so release builds can
+// stamp it from the git tag with -ldflags -X.
+var Version = "0.1.0"
 
 // subprotocol is the only WebSocket subprotocol this gateway accepts.
 const subprotocol = "mikissh"
@@ -110,7 +112,7 @@ func New(cfg *config.Config, log *logger.Logger) (*Gateway, error) {
 		return nil, err
 	}
 
-	ui, err := static.New(root+"/public", cfg.UIEnabled())
+	ui, err := static.New(root+"/public", cfg.UIEnabled(), public.FS)
 	if err != nil {
 		return nil, err
 	}

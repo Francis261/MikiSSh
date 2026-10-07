@@ -47,10 +47,43 @@ authentication and policy decisions on the gateway rather than the shell:
 
 ---
 
+## Install
+
+One line, one file — everything the gateway serves is compiled into the
+binary:
+
+```bash
+curl -fsSL https://github.com/Francis261/MikiSSh/releases/latest/download/install.sh | bash
+```
+
+The script detects your OS and architecture, verifies the download against
+`SHA256SUMS`, and writes to `/usr/local/bin` (or `~/.local/bin` if that is
+not writable). Override with `MIKISSH_INSTALL_DIR`.
+
+| | |
+| --- | --- |
+| Pin a version | `MIKISSH_VERSION=v0.1.0 curl -fsSL …/download/install.sh \| bash` |
+| Skip checksums | `MIKISSH_SKIP_VERIFY=1` (not recommended) |
+| Go toolchain | `go install github.com/Francis261/MikiSSh/cmd/mikissh@latest` |
+| Build from source | `go build -o bin/mikissh ./cmd/mikissh` |
+
+Prebuilt archives for `linux`, `darwin` and `freebsd` (amd64, arm64, plus
+linux/arm and linux/386) are attached to every release alongside
+`SHA256SUMS`. Windows builds the CLI but does not report local terminal
+resizes.
+
+To cut a release yourself:
+
+```bash
+GH_TOKEN=… ./scripts/release.sh v0.1.0
+```
+
+---
+
 ## Quick start
 
 ```bash
-# 1. build the binary (Go 1.24+)
+# 1. install the binary (see above), or build it:
 go build -o bin/mikissh ./cmd/mikissh
 
 # 2. a token for clients

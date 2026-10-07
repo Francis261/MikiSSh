@@ -193,15 +193,21 @@ type page struct {
 // get fetches a static asset over scheme://127.0.0.1:port.
 //
 // The request target is set verbatim: path normalisation would hide exactly
-// the traversal this exists to exercise.
+// the traversal this exists to exercise. Path carries the decoded form and
+// RawPath the literal wire form, otherwise url.URL re-escapes %2f into
+// %252f and the escape attempt never reaches the server as one.
 func get(t *testing.T, scheme string, port int, rawPath string) page {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, "https://example.invalid/", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	decoded, err := url.PathUnescape(rawPath)
+	if err != nil {
+		t.Fatalf("unescape %q: %v", rawPath, err)
+	}
 	host := fmt.Sprintf("127.0.0.1:%d", port)
-	req.URL = &url.URL{Scheme: scheme, Host: host, Path: rawPath, RawPath: rawPath}
+	req.URL = &url.URL{Scheme: scheme, Host: host, Path: decoded, RawPath: rawPath}
 
 	resp, err := testClient.Do(req)
 	if err != nil {

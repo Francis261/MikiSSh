@@ -6,11 +6,15 @@
 package static
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,18 +45,67 @@ const CSP = "default-src 'self'; " +
 // Handler serves files out of root, with traversal confined to that
 // directory.
 type Handler struct {
-	root    string
-	enabled bool
+	root     string
+	enabled  bool
+	embedded map[string]embeddedFile
+}
+
+// embeddedFile is one asset compiled into the binary, held with its
+// precomputed validators so serving needs no I/O and no re-hashing.
+type embeddedFile struct {
+	data  []byte
+	etag  string
+	ctype string
 }
 
 // New builds a Handler rooted at root. When enabled is false every request
 // gets a 404, which is how the UI is switched off entirely.
-func New(root string, enabled bool) (*Handler, error) {
+//
+// embedded, when non-nil, is consulted for any path root does not contain.
+// That is the fallback that lets a standalone binary — no public/ directory
+// anywhere on disk — still serve the UI; an on-disk file always wins, so a
+// working tree stays editable without a rebuild.
+func New(root string, enabled bool, embedded fs.FS) (*Handler, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{root: abs, enabled: enabled}, nil
+	h := &Handler{root: abs, enabled: enabled}
+	if embedded != nil {
+		files, err := readEmbedded(embedded)
+		if err != nil {
+			return nil, err
+		}
+		h.embedded = files
+	}
+	return h, nil
+}
+
+func readEmbedded(fsys fs.FS) (map[string]embeddedFile, error) {
+	out := make(map[string]embeddedFile, 8)
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, err := fs.ReadFile(fsys, p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		out[p] = embeddedFile{
+			data:  data,
+			etag:  `W/"` + hex.EncodeToString(sum[:12]) + `"`,
+			ctype: contentType(p),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read embedded assets: %w", err)
+	}
+	return out, nil
 }
 
 // Root reports the directory being served.
@@ -99,35 +152,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if p == "/" || p == "/index.html" {
-		h.serveFile(w, r, filepath.Join(h.root, "index.html"))
+		if !h.serveFile(w, r, filepath.Join(h.root, "index.html")) {
+			h.serveEmbedded(w, r, "index.html")
+		}
 		return
 	}
 
 	target := filepath.Join(h.root, p)
 	// filepath.Join cleans the result, so an escaping path lands outside
-	// root and fails this prefix test rather than being opened.
+	// root and fails this prefix test rather than being opened. This runs
+	// before the embedded lookup too, so a traversal attempt can never
+	// reach the compiled-in copy either.
 	if !strings.HasPrefix(target, h.root+string(os.PathSeparator)) {
 		plain(w, http.StatusForbidden, "forbidden", nil)
 		return
 	}
 
+	if !h.serveFile(w, r, target) {
+		h.serveEmbedded(w, r, p)
+	}
+}
+
+// serveFile writes the file at target. It reports false — without writing a
+// response — when target simply does not exist, so the caller can fall back
+// to the compiled-in copy. A path that exists but is not a readable regular
+// file is a genuine 404 and is answered here.
+func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, target string) bool {
 	st, err := os.Stat(target)
 	if err != nil {
-		plain(w, http.StatusNotFound, "not found", nil)
-		return
+		return false
 	}
 	if st.IsDir() {
 		plain(w, http.StatusNotFound, "not found", nil)
-		return
-	}
-	h.serveFile(w, r, target)
-}
-
-func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, target string) {
-	st, err := os.Stat(target)
-	if err != nil {
-		plain(w, http.StatusNotFound, "not found", nil)
-		return
+		return true
 	}
 
 	etag := fmt.Sprintf("W/%q", strconv.FormatInt(st.Size(), 10)+"-"+strconv.FormatInt(st.ModTime().UnixMilli(), 10))
@@ -137,13 +194,13 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, target strin
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		applyHeaders(w.Header(), hdr)
-		return
+		return true
 	}
 
 	f, err := os.Open(target)
 	if err != nil {
 		plain(w, http.StatusNotFound, "not found", nil)
-		return
+		return true
 	}
 	defer f.Close()
 
@@ -154,9 +211,46 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, target strin
 	w.WriteHeader(http.StatusOK)
 
 	if r.Method == http.MethodHead {
-		return
+		return true
 	}
 	_, _ = io.Copy(w, f)
+	return true
+}
+
+// serveEmbedded answers from the copy compiled into the binary.
+//
+// The request path is cleaned before it is used as an fs.FS key, and
+// fs.ValidPath then rejects anything still containing "..", so no request
+// can address outside the embedded tree.
+func (h *Handler) serveEmbedded(w http.ResponseWriter, r *http.Request, p string) {
+	key := strings.TrimPrefix(path.Clean("/"+p), "/")
+	if key == "" {
+		key = "index.html"
+	}
+	e, ok := h.embedded[key]
+	if !ok {
+		plain(w, http.StatusNotFound, "not found", nil)
+		return
+	}
+
+	hdr := header(true)
+	hdr.Set("ETag", e.etag)
+	if r.Header.Get("If-None-Match") == e.etag {
+		w.WriteHeader(http.StatusNotModified)
+		applyHeaders(w.Header(), hdr)
+		return
+	}
+
+	hdr.Set("Content-Type", e.ctype)
+	hdr.Set("Content-Length", strconv.Itoa(len(e.data)))
+	hdr.Set("Cache-Control", "no-cache")
+	applyHeaders(w.Header(), hdr)
+	w.WriteHeader(http.StatusOK)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(e.data)
 }
 
 func header(withCSP bool) http.Header {

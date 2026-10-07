@@ -12,10 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Francis261/MikiSSh/internal/protocol"
@@ -394,15 +392,6 @@ func (c *cli) keepalive() {
 		if frame, err := protocol.Encode(protocol.TypePing, nil); err == nil {
 			c.send(frame)
 		}
-	}
-}
-
-func (c *cli) watchResize() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
-	defer signal.Stop(ch)
-	for range ch {
-		c.sendResize()
 	}
 }
 

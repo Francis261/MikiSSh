@@ -15,5 +15,8 @@ certs/
 logs/
 .pm2/
 
+# Release staging (produced by scripts/release.sh)
+dist/
+
 # Leftovers from the previous Node implementation
 node_modules/
