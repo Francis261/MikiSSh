@@ -53,32 +53,30 @@ fail() { bad "$*"; }
 # Read a dotted path out of the config file. Never prints secrets.
 cfg() {
   [ -f "$CONFIG" ] || return 0
-  node -e "
-    const c = require(process.argv[1]);
-    const v = '$1'.split('.').reduce((a, k) => (a == null ? a : a[k]), c);
-    if (Array.isArray(v)) process.stdout.write(v.join(', '));
-    else if (v === true) process.stdout.write('true');
-    else if (v === false) process.stdout.write('false');
-    else if (v != null) process.stdout.write(String(v));
-  " "$CONFIG" 2>/dev/null || true
+  jq -r --arg p "$1" '
+    ($p | split(".")) as $k
+    | getpath($k)
+    | if . == null then empty
+      elif type == "array" then map(tostring) | join(", ")
+      elif type == "object" then tojson
+      else tostring end
+  ' "$CONFIG" 2>/dev/null || true
 }
 
 # pm2 status rows for our two apps only.
 pm2_rows() {
-  pm2 jlist 2>/dev/null | node -e "
-    let s = '';
-    process.stdin.on('data', d => s += d).on('end', () => {
-      try {
-        const apps = JSON.parse(s).filter(a => /^(mikissh-)/.test(a.name));
-        for (const a of apps) {
-          const e = a.pm2_env;
-          // pm2 exposes the start time as pm_uptime (epoch ms).
-          const started = e.pm_uptime ?? e.pm2_uptime;
-          const up = started ? Math.round((Date.now() - started) / 1000) + 's' : '-';
-          console.log([a.name, e.status, up, String(e.restart_time ?? 0)].join('\t'));
-        }
-      } catch {}
-    });" 2>/dev/null || true
+  pm2 jlist 2>/dev/null | jq -r '
+    .[]
+    | select(.name | test("^mikissh-"))
+    | (.pm2_env.pm_uptime // .pm2_env.pm2_uptime) as $start
+    | [ .name,
+        .pm2_env.status,
+        (if $start == null
+         then "-"
+         else (((now * 1000) - $start) / 1000 | round | tostring) + "s" end),
+        (.pm2_env.restart_time // 0 | tostring) ]
+    | @tsv
+  ' 2>/dev/null || true
 }
 
 listening() { ss -tlnp 2>/dev/null | grep -cE ":$1\b" || true; }
@@ -119,7 +117,7 @@ cmd_status() {
   head2 "POLICY"
   local origins; origins="$(cfg security.allowedOrigins)"
   if [ -n "$origins" ]; then ok "allowedOrigins: $origins"; else fail "allowedOrigins empty (internet-facing!)"; fi
-  local toks; toks="$(node -e "const c=require('$CONFIG');console.log((c.auth&&c.auth.tokens||[]).length)" 2>/dev/null || echo 0)"
+  local toks; toks="$(jq -r '((.auth.tokens) // []) | length' "$CONFIG" 2>/dev/null || echo 0)"
   [ "$toks" -gt 0 ] && ok "auth tokens configured: $toks (value not shown)" || fail "no auth tokens configured"
 
   head2 "PUBLIC"
@@ -141,10 +139,15 @@ probe_public() {
 # ==================================================================== doctor
 cmd_doctor() {
   head2 "FILES"
-  [ -d "$ROOT/node_modules" ] && ok "node_modules present" || fail "node_modules missing — run: npm ci"
-  [ -f "$ROOT/package-lock.json" ] && ok "package-lock.json present" || fail "package-lock.json missing"
+  [ -x "$ROOT/bin/mikissh" ] \
+    && ok "gateway binary present ($(stat -c%s "$ROOT/bin/mikissh") bytes)" \
+    || fail "gateway binary missing — run: go build -o bin/mikissh ./cmd/mikissh"
+  [ -f "$ROOT/go.mod" ] && ok "go.mod present" || fail "go.mod missing"
   [ -f "$CONFIG" ] && ok "config present" || fail "config missing: mikissh.config.json"
-  [ -f "$ROOT/certs/server.crt" ] && ok "TLS certificate present" || fail "TLS certificate missing — run: npm run gen-cert"
+  [ -f "$ROOT/certs/server.crt" ] && ok "TLS certificate present" || fail "TLS certificate missing — run: ./bin/mikissh gen-cert"
+  [ -f "$ROOT/public/index.html" ] && ok "web UI present" || fail "public/index.html missing"
+  [ -f "$ROOT/public/vendor/xterm.js" ] && ok "vendored xterm present" \
+    || fail "public/vendor/xterm.js missing — the UI needs a CDN-free terminal"
   [ -f "$ROOT/.ssh/id_ed25519" ] && ok "SSH gateway key present (mode $(stat -c%a "$ROOT/.ssh/id_ed25519"))" \
     || warn "SSH key missing — gateway will fall back to agent/default identities"
 
@@ -156,10 +159,12 @@ cmd_doctor() {
   fi
 
   head2 "TOOLING"
-  command -v node     >/dev/null && ok "node $(node -v)"     || fail "node not found"
-  command -v pm2      >/dev/null && ok "pm2 installed"        || fail "pm2 not found"
+  command -v jq        >/dev/null && ok "jq installed"        || fail "jq not found — manage.sh reads the config with it"
+  command -v node      >/dev/null && ok "node $(node -v) (pm2 runtime)" || fail "node not found — pm2 cannot run"
+  command -v pm2       >/dev/null && ok "pm2 installed"       || fail "pm2 not found"
   command -v cloudflared >/dev/null && ok "cloudflared installed" || fail "cloudflared not found"
-  [ -d "$ROOT/node_modules/ws" ] && ok "dependency 'ws' resolvable" || fail "dependency 'ws' missing — run: npm ci"
+  command -v go        >/dev/null && ok "go toolchain available for rebuilds" \
+    || warn "go not installed — the binary cannot be rebuilt on this host"
 
   head2 "PROCESS"
   local rows; rows="$(pm2_rows)"
@@ -209,7 +214,7 @@ cmd_doctor() {
 
 # ============================================================== start/stop
 cmd_start() {
-  [ -d "$ROOT/node_modules" ] || { warn "node_modules missing — running npm ci"; npm ci --no-audit --no-fund; }
+  [ -x "$ROOT/bin/mikissh" ] || { warn "gateway binary missing — building"; go build -o bin/mikissh ./cmd/mikissh; }
   pm2 start "$ROOT/ecosystem.config.cjs"
   sleep 2
   cmd_status
@@ -247,41 +252,44 @@ cmd_logs() {
 
 # ==================================================================== test
 cmd_test() {
-  [ -d "$ROOT/node_modules/ws" ] || { warn "dependencies missing — running npm ci"; npm ci --no-audit --no-fund; }
-  npm test
+  local unformatted
+  unformatted="$(gofmt -l cmd internal)" || true
+  if [ -n "$unformatted" ]; then
+    warn "gofmt would rewrite: $(printf '%s' "$unformatted" | tr '\n' ' ')"
+  fi
+  go vet ./...
+  go test ./...
 }
 
 # ================================================================= connect
 cmd_connect() {
   if [ -z "${MIKISSH_TOKEN:-}" ]; then
     # Pull the first configured token into the environment without printing it.
-    MIKISSH_TOKEN="$(node -e "
-      const c = require(process.argv[1]);
-      process.stdout.write(((c.auth || {}).tokens || [])[0] || '');
-    " "$CONFIG" 2>/dev/null || true)"
+    MIKISSH_TOKEN="$(jq -r '((.auth.tokens) // [""])[0] // ""' "$CONFIG" 2>/dev/null || true)"
     export MIKISSH_TOKEN
   fi
   [ -n "${MIKISSH_TOKEN:-}" ] || { fail "no token available — set MIKISSH_TOKEN or add one to the config"; exit 1; }
   info "connecting to wss://mikissh.ryion.com$WS_PATH"
-  exec node "$ROOT/bin/mikissh.js" client --url "wss://mikissh.ryion.com$WS_PATH" "$@"
+  exec "$ROOT/bin/mikissh" client --url "wss://mikissh.ryion.com$WS_PATH" "$@"
 }
 
 # =================================================================== token
 cmd_token() {
-  node "$ROOT/bin/mikissh.js" gen-token
+  "$ROOT/bin/mikissh" gen-token
 }
 
 # ================================================================= recover
-# Full restore after a host reset: wipes node_modules, the pm2 dump and the
-# systemd unit.
+# Full restore after a host reset: rebuilds the binary if it is gone, the
+# pm2 dump and the systemd unit.
 cmd_recover() {
   head2 "RECOVERING"
 
-  if [ ! -d "$ROOT/node_modules" ]; then
-    info "node_modules missing → npm ci"
-    npm ci --no-audit --no-fund
+  if [ ! -x "$ROOT/bin/mikissh" ]; then
+    info "gateway binary missing → go build"
+    go build -o bin/mikissh ./cmd/mikissh
+    ok "gateway binary built"
   else
-    ok "node_modules present"
+    ok "gateway binary present"
   fi
 
   pm2 start "$ROOT/ecosystem.config.cjs" >/dev/null 2>&1 || pm2 restart "$APP_GW" "$APP_TUN" >/dev/null 2>&1 || true

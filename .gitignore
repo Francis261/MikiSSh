@@ -1,11 +1,19 @@
-node_modules/
-certs/
+# Compiled binary — rebuild with: go build -o bin/mikissh ./cmd/mikissh
+bin/mikissh
+
+# Secrets and runtime state
+mikissh.config.json
+.cf-tunnel-token
+.env
 .ssh/
 id_ed25519
 *.key
 *.pub
-mikissh.config.json
-.cf-tunnel-token
-.env
+certs/
+
+# Runtime output
 logs/
 .pm2/
+
+# Leftovers from the previous Node implementation
+node_modules/

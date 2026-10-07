@@ -19,6 +19,13 @@ const root = __dirname;
 const logs = path.join(root, 'logs');
 fs.mkdirSync(logs, { recursive: true });
 
+const binary = path.join(root, 'bin/mikissh');
+if (!fs.existsSync(binary)) {
+  console.warn(
+    `[ecosystem] bin/mikissh missing — run: go build -o bin/mikissh ./cmd/mikissh`,
+  );
+}
+
 const tokenFile = path.join(root, '.cf-tunnel-token');
 const hasToken =
   fs.existsSync(tokenFile) && fs.readFileSync(tokenFile, 'utf8').trim().length > 0;
@@ -27,9 +34,10 @@ const apps = [
   {
     name: 'mikissh-gateway',
     cwd: root,
-    script: path.join(root, 'bin/mikissh.js'),
+    script: binary,
     args: ['server', '--config', path.join(root, 'mikissh.config.json')],
-    interpreter: 'node',
+    // A compiled binary, so pm2 must not wrap it in a node interpreter.
+    interpreter: 'none',
     autorestart: true,
     min_uptime: '10s',
     max_restarts: 30,
@@ -38,7 +46,6 @@ const apps = [
     error_file: path.join(logs, 'gateway.err.log'),
     merge_logs: true,
     time: true,
-    env: { NODE_ENV: 'production' },
   },
 ];
 

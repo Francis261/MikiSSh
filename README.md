@@ -11,7 +11,7 @@ through a single hardened WSS endpoint.
           ┌───────────────────┐
           │  MikiSSh gateway  │  TLS 1.3 · token auth · rate limit · origin allowlist
           └─────────┬─────────┘
-                    │ SSH (ssh2, server-side credentials)
+                    │ SSH (golang.org/x/crypto/ssh, server-side credentials)
                     ▼
                ┌─────────┐
                │  sshd   │
@@ -21,6 +21,11 @@ through a single hardened WSS endpoint.
 The gateway speaks WebSocket to the client and the SSH protocol to `sshd`.
 Terminal bytes, resize events, exit codes and keepalives travel over a small
 binary protocol inside WebSocket frames.
+
+Everything is a single statically-linked Go binary — no runtime, no
+`node_modules`, nothing to reinstall after a host reset. Only pm2 (Node's
+process manager) and `cloudflared` remain external, and neither is a
+dependency of the gateway itself.
 
 ---
 
@@ -45,27 +50,28 @@ authentication and policy decisions on the gateway rather than the shell:
 ## Quick start
 
 ```bash
-npm install
+# 1. build the binary (Go 1.24+)
+go build -o bin/mikissh ./cmd/mikissh
 
-# 1. a token for clients
-npm run gen:token
+# 2. a token for clients
+./bin/mikissh gen-token
 
-# 2. TLS material (self-signed, for development)
-npm run gen:cert
+# 3. TLS material (self-signed, for development)
+./bin/mikissh gen-cert
 
-# 3. point the gateway at your SSH server
+# 4. point the gateway at your SSH server
 cp config.example.json mikissh.config.json
 $EDITOR mikissh.config.json      # set auth.tokens, ssh.*
 
-# 4. run it
-npm start                        # https://<host>:8022
+# 5. run it
+./bin/mikissh server             # https://<host>:8022
 ```
 
 Then either open `https://<host>:8022/` in a browser, or attach your local
 TTY:
 
 ```bash
-node bin/mikissh.js client --url wss://host:8022/ssh --token "$TOKEN"
+./bin/mikissh client --url wss://host:8022/ssh --token "$TOKEN"
 ```
 
 The CLI refuses non-`wss://` endpoints. Drop `--insecure` once you have a
@@ -99,14 +105,16 @@ exist is a startup error rather than a silent downgrade to password auth.
 
 ## Security model
 
-**Transport.** `minVersion` is pinned to `TLSv1.3`. Message compression is
-disabled (`perMessageDeflate: false`) to avoid CRIME-class side channels.
+**Transport.** `minVersion` is pinned to `TLSv1.3`, and HTTP/2 is explicitly
+disabled so upgrades can be hijacked — the only handshake this server ever
+needs. WebSocket permessage-deflate is never negotiated, avoiding
+CRIME-class side channels.
 
-**Client authentication.** A bearer token, verified with `timingSafeEqual`
-against every configured token. Browsers cannot set arbitrary headers, so the
-token rides in `Sec-WebSocket-Protocol` (`["mikissh", "t.<token>"]`) rather
-than the query string, which routinely ends up in access logs. `?token=` is
-accepted as a fallback for convenience.
+**Client authentication.** A bearer token, verified with a constant-time
+comparison against every configured token. Browsers cannot set arbitrary
+headers, so the token rides in `Sec-WebSocket-Protocol` (`["mikissh",
+"t.<token>"]`) rather than the query string, which routinely ends up in
+access logs. `?token=` is accepted as a fallback for convenience.
 
 **Brute-force protection.** A per-IP sliding window. Once the limit is hit the
 IP is locked out for the remainder of the window — *including* for the correct
@@ -126,15 +134,17 @@ idle timeout, a hard frame-size limit, and a PTY/term allowlist.
 
 **Web UI.** Served with a strict CSP (`default-src 'self'`, `frame-ancestors
 'none'`), `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy:
-no-referrer`. xterm.js is served from local `node_modules`, so the page makes
-no third-party requests at runtime. Path traversal is normalised and
-prefix-checked.
+no-referrer`. xterm.js is vendored under `public/vendor`, so the page makes no
+third-party requests at runtime and needs no package manager to restore. Path
+traversal is rejected before anything reaches the filesystem.
 
 **Logging.** Structured JSON. Tokens and key material are redacted; a
 truncated SHA-256 fingerprint is logged so sessions remain auditable.
 
-**SSH algorithms.** The gateway advertises only modern KEX, ciphers and host
-key types, so a permissive backend `sshd` cannot negotiate weak algorithms.
+**SSH algorithms.** KEX, ciphers and host key types are pinned explicitly —
+stronger than the library defaults — so a permissive backend `sshd` cannot
+negotiate weak algorithms. ML-KEM 768 (post-quantum) is offered for key
+exchange; DH14-SHA1 and HMAC-SHA1 are excluded.
 
 ---
 
@@ -166,13 +176,17 @@ protocol violations and close the session.
 ## Testing
 
 ```bash
-npm test
+go test ./...        # or: ./manage.sh test
 ```
 
 Covers the codec, token verification and rate limiting, config resolution, and
 a live gateway: missing/invalid tokens, disallowed origins, plaintext
-upgrades, CSP and security headers, vendored assets, path traversal, and
-protocol violations.
+upgrades, CSP and security headers, vendored assets, path traversal, protocol
+violations, loopback-listener binding, and error replies on wrong paths.
+
+Unit tests resolve paths through a discovered project root rather than the
+working directory, so they run from anywhere — including a bare checkout
+without a config file or SSH key.
 
 ---
 
@@ -208,7 +222,7 @@ The manifest runs two apps:
 
 | App | Command | Logs |
 | --- | --- | --- |
-| `mikissh-gateway` | `node bin/mikissh.js server --config mikissh.config.json` | `logs/gateway.log` |
+| `mikissh-gateway` | `bin/mikissh server --config mikissh.config.json` | `logs/gateway.log` |
 | `mikissh-tunnel` | `cloudflared tunnel --no-autoupdate run --token-file …` | `logs/tunnel.err.log` |
 
 **Origin URL.** The gateway exposes two listeners:
@@ -227,19 +241,20 @@ and is passed with `--token-file` rather than `--token`, so it never appears in
 
 ### After a host reset
 
-This environment resets periodically, which wipes `node_modules`, the pm2
-dump, and the `pm2-root.service` systemd unit. Recovery:
+This environment resets periodically, which wipes the pm2 dump and the
+`pm2-root.service` systemd unit — but there is no longer any dependency tree
+to restore, because the gateway is one binary:
 
 ```bash
 cd ~/MikiSSh
-./manage.sh recover             # npm ci + pm2 start + save + startup, then runs doctor
+./manage.sh recover             # build if needed + pm2 start + save + startup, then runs doctor
 ```
 
 If you would rather do it by hand:
 
 ```bash
 cd ~/MikiSSh
-npm ci                                  # restore dependencies from the lockfile
+go build -o bin/mikissh ./cmd/mikissh   # only if the binary is missing
 pm2 start ecosystem.config.cjs          # re-register both apps
 pm2 save                                # rewrite the process list
 pm2 startup && systemctl enable pm2-root   # restore boot persistence
