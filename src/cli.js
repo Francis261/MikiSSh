@@ -83,7 +83,21 @@ export async function runClient({ url, token, insecure = false, term }) {
   });
 
   ws.on('unexpected-response', (_req, res) => {
-    fail(`gateway rejected upgrade (HTTP ${res.statusCode})`);
+    // Drain the body: on a wrong path the gateway explains where to connect.
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => {
+      const body = Buffer.concat(chunks).toString('utf8').trim();
+      const code = res.statusCode;
+      const hint =
+        code === 404
+          ? ' — wrong URL path; the endpoint is /ssh'
+          : code >= 500
+            ? ' — the edge could not reach the gateway'
+            : '';
+      fail(`gateway rejected upgrade (HTTP ${code})${hint}${body ? `\n  ${body.replace(/\n/g, '\n  ')}` : ''}`);
+    });
+    res.resume();
   });
 
   ws.on('message', (raw, isBinary) => {
@@ -180,8 +194,10 @@ export async function runClient({ url, token, insecure = false, term }) {
   }
 
   function fail(message, code = 1) {
-    status(message);
-    process.stderr.write(`mikissh: ${message}\n`);
+    // print exactly once: status() would duplicate the line, and a follow-on
+    // socket error after the first failure must not overwrite the real cause.
+    if (done) return;
+    process.stderr.write(`\r\x1b[2Kmikissh: ${message}\n`);
     finish(code);
   }
 

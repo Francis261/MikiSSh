@@ -65,8 +65,21 @@ export class Gateway {
         /* fall through to the rejection below */
       }
       if (reqPath !== path) {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-        socket.destroy();
+        const seen = reqPath ?? req.url ?? '(unparsable)';
+        const body =
+          `MikiSSh: no WebSocket endpoint at ${seen}.\n` +
+          `The endpoint is ${path}, e.g. wss://<host>${path}\n`;
+        const payload =
+          'HTTP/1.1 404 Not Found\r\n' +
+          'Content-Type: text/plain; charset=utf-8\r\n' +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          'Connection: close\r\n' +
+          '\r\n' +
+          body;
+        // socket.end() flushes before sending FIN. destroy() would race the
+        // write and truncate the reply, which a proxy in front (cloudflared,
+        // nginx) turns into a 502 instead of this 404.
+        socket.end(payload);
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));

@@ -74,6 +74,20 @@ function attempt(port, { token, protocol = 'ws', path = '/ssh', origin } = {}) {
     });
     ws.on('close', (code) => done({ ok: false, code }));
     ws.on('error', (e) => done({ ok: false, error: e.message }));
+    // Capture a rejected upgrade so tests can assert on the real HTTP status
+    // and body rather than just "it did not connect".
+    ws.on('unexpected-response', (_req, res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () =>
+        done({
+          ok: false,
+          http: res.statusCode,
+          body: Buffer.concat(chunks).toString('utf8'),
+        }),
+      );
+      res.resume();
+    });
   });
 }
 
@@ -115,6 +129,17 @@ describe('loopback plain-HTTP listener', () => {
   test('rejects an upgrade on the wrong path', async () => {
     const r = await attempt(plainPort, { token: TOKEN, protocol: 'ws', path: '/admin' });
     assert.equal(r.ok, false, 'upgrade on an unexpected path must not be accepted');
+    // The reply must be a fully-formed 404. Truncating it (destroy() racing
+    // the write) makes any proxy in front report 502 instead.
+    assert.equal(r.http, 404, `expected 404, got ${JSON.stringify(r)}`);
+    assert.match(r.body, /\/ssh/, 'the error should point at the real endpoint');
+  });
+
+  test('rejects an upgrade at the site root the same way', async () => {
+    const r = await attempt(plainPort, { token: TOKEN, protocol: 'ws', path: '/' });
+    assert.equal(r.ok, false);
+    assert.equal(r.http, 404, `expected 404, got ${JSON.stringify(r)}`);
+    assert.match(r.body, /\/ssh/);
   });
 
   test('still serves the web UI on both listeners', async () => {
